@@ -1,0 +1,191 @@
+# асинхронные requests
+!pip install aiohttp[speedups]
+import pandas as pd
+import numpy as np
+import asyncio
+from bs4 import BeautifulSoup as bs
+import requests as req
+import aiohttp
+from itertools import product
+import tqdm
+
+CONCURRENCY = 10
+TIMEOUT = 60*90
+def list_pull(L):
+    # Распаковка вложенных списков
+    return [x for y in L for x in list_pull(y)] if isinstance(L, list) else [L]
+
+
+def group_nums(form='ochn'):
+    # ochn - очная, zaochn - заочная, spo - колледжи
+    url = f'http://www.novsu.ru/univer/timetable/{form}/'
+    soup = bs(req.get(url).text, features="lxml")
+    pulled = list_pull([line.find_all('a') for line in soup.find_all('td')])
+    nums = set([i.string.strip() for i in pulled if i.string.strip()[0].isdigit()])
+    return nums
+
+
+async def fetch(session, sem, url):
+    async with sem:
+        async with session.get(url) as response:
+            return await response.text(), str(response.url).split('=')[-1]
+
+
+async def get_url_data(urls, headers=None):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+    tasks = []
+    async with aiohttp.ClientSession(headers=headers,
+                                     timeout=timeout) as session:
+        for i in urls:
+            task = asyncio.wait_for(fetch(session, sem, i), TIMEOUT)
+            tasks.append(task)
+        responses = [await f for f in
+                     tqdm.tqdm(asyncio.as_completed(tasks), total=len(tasks))]
+    return responses
+
+
+def run(urls, headers=None):
+    loop = asyncio.get_event_loop()
+    future = asyncio.ensure_future(get_url_data(urls, headers))
+    return loop.run_until_complete(future)
+
+
+def group_infs(requests):
+    parsed_dict = dict()
+    for req, gr in requests:
+        request = bs(req, features="lxml").find_all('ul')
+        parsed_dict[gr] = [i for i in request if 'Год ' in i.text]
+    return parsed_dict
+
+
+def group_ids(requests):
+    parsed_dict = dict()
+    for req, gr in requests:
+        request = bs(req, features="lxml").find_all('a', string='Версия для печати')
+        parsed_dict[gr] = [i.attrs['href'].split('grpid=')[-1] for i in request]
+    return parsed_dict
+
+
+def students_by_gr(requests):
+    data = dict()
+    for req, gr in requests:
+        soup = [[(j.contents[3].contents[0].attrs['href'].split('/')[-1],
+                  j.contents[3].text.strip().rstrip(' .'))
+                for j in i.contents[3::2]] for i in bs(req).select('table') if 'ФИО' in i.text]
+        data[gr] = soup
+    return data
+
+
+def combine_infs(requests):
+    ids = group_ids(requests)
+    infs = group_infs(requests)
+    students = students_by_gr(requests)
+    groups_info = dict()
+    for gr in ids:
+        for id, content, studs in zip(ids[gr], infs[gr], students[gr]):
+            groups_info[id] = {
+                'Номер группы': gr,
+                'Год поступления': content.contents[1].text.strip().split(': ')[1],
+                'Лет обучения': content.contents[1].contents[1].strip().split(': ')[1],
+                'Специальность': content.contents[3].text.strip().split(': ')[1],
+                'Отделение': content.contents[4].text.strip().split(': ')[1],
+                'Институт': content.contents[5].text.strip().split(': ')[1],
+                'Форма обучения': content.contents[6].text.strip().split(': ')[1],
+                'Список студентов': studs
+            }
+    return groups_info
+
+def get_by_id(responses):
+    return {ind:[('NaN', i.text.strip().rstrip(' .'))
+                for i in bs(resp).select('td[nowrap]')] for resp, ind in responses}
+# Список групп со страницы с расписанием
+groups_ochn = group_nums()
+groups_zaochn = group_nums('zaochn')
+groups_spo = group_nums('spo')
+
+# Комбинации групп с разным годом зачисления
+all_groups_ochn = set(map(lambda x: str(x[0])+x[1], product(range(10), map(lambda x: x[1:], groups_ochn))))
+all_groups_zaochn = set(map(lambda x: str(x[0])+x[1], product(range(10), map(lambda x: x[1:] if len(x)<=5 else x[1:-2], groups_zaochn))))
+all_groups_spo = set(map(lambda x: str(x[0])+x[1], product(range(10), map(lambda x: x[1:] if len(x)<5 else x[1:-2], groups_spo))))
+
+print('Группы из расписания', len(groups_ochn|all_groups_ochn|groups_spo))
+print('Комбинации групп', len(all_groups_ochn|all_groups_zaochn|all_groups_spo))
+
+poss_groups = set(map(lambda x: str(x[0])+x[1],
+                      product(range(10), map(lambda x: str(x)[1:], range(1000, 10000)))))
+print('Комбинации групп', len(poss_groups))
+
+CONCURRENCY = 2000 # Колличество потоков для парсинга
+url = 'http://www.novsu.ru/search/groups/r.2500.p.search.g.2325/i.2500/?page=search&grpname={}'
+
+# Список ответов от сайта новгу
+responses = run([url.format(n) for n in poss_groups])
+# Функция, которая парсит ответы на наличие группы.
+tmp = students_by_gr(responses)
+groups = [i for i in tmp if tmp[i]]
+print('\n', len(groups))
+
+CONCURRENCY = 10 # Уменьшаем колличество потоков
+url = 'http://www.novsu.ru/search/groups/r.2500.p.search.g.2325/i.2500/?page=search&grpname={}'
+
+# Свои куки я потер
+headers = {
+        'Cookie': ''
+}
+# В этот раз берем только список существующих групп
+responses = run([url.format(n) for n in groups], headers=headers)
+print('\n', len(responses))
+
+# Функция для парсинга информации о группах
+groups_dict = combine_infs(responses)
+
+# В табличном виде
+groups_table = pd.DataFrame(groups_dict).T.reset_index()
+groups_table
+
+print('Id всего', len(groups_table['index']))
+print('Id без списка студентов', len(groups_table[groups_table['Список студентов'].apply(len) == 0]))
+
+ids = groups_table['index'][groups_table['Список студентов'].apply(len) == 0]
+
+CONCURRENCY = 20
+url = 'http://www.novsu.ru/search/groups/r.2500/i.2500..4/?page=print&grpid={}'
+
+# В этот раз берем только список существующих групп
+responses = run([url.format(n) for n in ids])
+print('\n', len(responses))
+
+# Словарь с ключем id группы: значением - список студентов
+ids_dict = get_by_id(responses)
+
+# Объединяем списки студентов
+groups_table['Список студентов'] = pd.concat([groups_table['index'][groups_table['Список студентов'].apply(len) == 0].apply(lambda x: ids_dict[x]),
+                                              groups_table['Список студентов'][groups_table['Список студентов'].apply(len) > 0]], axis=0)
+groups_table.head()
+
+# функция для раскрытия списков 
+def unpack(df, lst_col):
+    return pd.concat([pd.DataFrame({col:np.repeat(df[col].values, df[lst_col].str.len()) for col in df.columns.drop(lst_col)}),
+                pd.DataFrame(np.concatenate(df[lst_col].tolist()))], axis=1)
+                
+students_table = unpack(groups_table, 'Список студентов').rename(columns={0:'Id студента', 1: 'Студент', 'index': 'Id группы'})
+students_table.head()
+
+from google.colab import files
+
+uploaded = files.upload()
+
+for fn in uploaded.keys():
+  print('User uploaded file "{name}" with length {length} bytes'.format(
+      name=fn, length=len(uploaded[fn])))
+      
+students_table = pd.read_csv('students.csv', dtype={'Номер группы':str, 'Id студента':str})
+students_table.head()
+
+students_table.nunique()
+
+students_table[students_table['Студент'].str.contains("Дьяченко")]
+
+students_table[students_table['Лет обучения']=='7']
+
